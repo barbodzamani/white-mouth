@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Voice Assistant</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&display=swap');
+
+  *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+  html, body {
+    width: 100%; height: 100%;
+    background: #000;
+    overflow: hidden;
+    font-family: 'Share Tech Mono', monospace;
+  }
+
+  /* ── Setup screen ── */
+  #setup {
+    position: fixed; inset: 0;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    gap: 28px;
+    z-index: 100;
+    background: #000;
+  }
+
+  #setup h1 {
+    font-size: 10px;
+    letter-spacing: 10px;
+    color: rgba(255,255,255,0.18);
+    text-transform: uppercase;
+  }
+
+  #setup input {
+    background: none;
+    border: none;
+    border-bottom: 1px solid rgba(255,255,255,0.15);
+    outline: none;
+    color: #fff;
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 13px;
+    letter-spacing: 3px;
+    padding: 10px 4px;
+    width: 320px;
+    text-align: center;
+  }
+  #setup input::placeholder { color: rgba(255,255,255,0.12); }
+
+  #setup button {
+    background: none;
+    border: 1px solid rgba(255,255,255,0.15);
+    color: rgba(255,255,255,0.4);
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 10px;
+    letter-spacing: 5px;
+    padding: 13px 44px;
+    cursor: pointer;
+    text-transform: uppercase;
+    transition: all 0.3s;
+  }
+  #setup button:hover {
+    border-color: rgba(255,255,255,0.5);
+    color: rgba(255,255,255,0.8);
+  }
+
+  #setup .note {
+    font-size: 10px;
+    letter-spacing: 1px;
+    color: rgba(255,255,255,0.1);
+    text-align: center;
+    line-height: 2;
+    max-width: 340px;
+  }
+
+  /* ── Main app ── */
+  #app {
+    display: none;
+    position: fixed; inset: 0;
+    align-items: center; justify-content: center;
+    flex-direction: column;
+  }
+
+  /* The single canvas — full width, centered vertically */
+  #waveCanvas {
+    position: absolute;
+    left: 0; right: 0;
+    top: 50%; transform: translateY(-50%);
+    width: 100%;
+    height: 120px;
+    display: block;
+  }
+
+  /* Status text — very faint, bottom */
+  #status {
+    position: absolute;
+    bottom: 36px;
+    left: 50%;
+    transform: translateX(-50%);
+    font-size: 9px;
+    letter-spacing: 6px;
+    color: rgba(255,255,255,0.1);
+    text-transform: uppercase;
+    white-space: nowrap;
+    transition: color 0.6s;
+    pointer-events: none;
+  }
+
+  /* Transcript — very faint, upper area */
+  #transcript {
+    position: absolute;
+    top: 38%;
+    left: 50%;
+    transform: translate(-50%, -100%);
+    font-size: 11px;
+    letter-spacing: 2px;
+    color: rgba(255,255,255,0.07);
+    text-transform: uppercase;
+    white-space: nowrap;
+    max-width: 90vw;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+
+<!-- Setup -->
+<div id="setup">
+  <h1>Voice Assistant</h1>
+  <input id="apiKey" type="password" placeholder="Enter Groq API Key">
+  <button onclick="startApp()">Activate</button>
+  <div class="note">
+    Get a free key at console.groq.com<br>
+    The assistant will listen continuously<br>
+    and respond with its voice.
+  </div>
+</div>
+
+<!-- App -->
+<div id="app">
+  <canvas id="waveCanvas"></canvas>
+  <div id="transcript"></div>
+  <div id="status">listening</div>
+</div>
+
+<script>
+// ─── Globals ───────────────────────────────────────────────
+let GROQ_KEY = '';
+let recognition = null;
+let isProcessing = false;
+let isSpeaking = false;
+let conversationHistory = [];
+
+// Wave state
+let wavePhase = 0;
+let waveIntensity = 0;       // current (lerped)
+let waveTarget = 0;          // target
+let waveVarianceTimer = null;
+
+// Audio context for mic amplitude (listening viz)
+let audioCtx = null, analyser = null, micSource = null, micData = null;
+
+const canvas = document.getElementById('waveCanvas');
+const ctx2d = canvas.getContext('2d');
+
+// ─── Canvas resize ─────────────────────────────────────────
+function resizeCanvas() {
+  canvas.width = window.innerWidth * devicePixelRatio;
+  canvas.height = 120 * devicePixelRatio;
+  canvas.style.width = window.innerWidth + 'px';
+  canvas.style.height = '120px';
+}
+window.addEventListener('resize', resizeCanvas);
+
+// ─── Wave draw loop ────────────────────────────────────────
+function drawWave() {
+  requestAnimationFrame(drawWave);
+
+  const W = canvas.width, H = canvas.height;
+  ctx2d.clearRect(0, 0, W, H);
+
+  // Lerp intensity
+  waveIntensity += (waveTarget - waveIntensity) * 0.1;
+
+  // When listening, get mic amplitude for subtle idle movement
+  let micAmp = 0;
+  if (!isSpeaking && analyser && micData) {
+    analyser.getByteTimeDomainData(micData);
+    let sum = 0;
+    for (let i = 0; i < micData.length; i++) sum += Math.abs(micData[i] - 128);
+    micAmp = (sum / micData.length) / 128 * 0.12;
+  }
+
+  const amp = (waveIntensity + micAmp) * (H * 0.38);
+  const cy = H / 2;
+
+  // Glow layers: draw wave 3 times with increasing blur for a neon glow
+  for (let pass = 0; pass < 3; pass++) {
+    const blurs = [0, 6, 16];
+    const alphas = [1, 0.35, 0.12];
+    ctx2d.save();
+    ctx2d.shadowBlur = 0;
+    ctx2d.globalAlpha = alphas[pass];
+    ctx2d.filter = blurs[pass] > 0 ? `blur(${blurs[pass]}px)` : 'none';
+    ctx2d.strokeStyle = '#ffffff';
+    ctx2d.lineWidth = devicePixelRatio * (pass === 0 ? 1.5 : 2.5);
+    ctx2d.lineCap = 'round';
+    ctx2d.lineJoin = 'round';
+
+    ctx2d.beginPath();
+    const segments = 300;
+    for (let i = 0; i <= segments; i++) {
+      const t = i / segments;
+      const x = t * W;
+
+      // Envelope: taper at edges so line doesn't fly off screen ends
+      const env = Math.sin(t * Math.PI);
+
+      // Multi-harmonic wave for organic radio feel
+      const y = cy
+        + env * amp * (
+            Math.sin(t * Math.PI * 5 + wavePhase)
+          + 0.45 * Math.sin(t * Math.PI * 11 + wavePhase * 1.3)
+          + 0.2  * Math.sin(t * Math.PI * 17 + wavePhase * 0.8)
+          + 0.1  * Math.sin(t * Math.PI * 29 + wavePhase * 2.1)
+        );
+
+      if (i === 0) ctx2d.moveTo(x, y);
+      else ctx2d.lineTo(x, y);
+    }
+    ctx2d.stroke();
+    ctx2d.restore();
+  }
+
+  // Advance phase
+  if (waveIntensity > 0.01 || micAmp > 0.005) {
+    const speed = isSpeaking ? 0.16 : 0.04;
+    wavePhase += speed * (0.8 + waveIntensity * 0.6);
+  }
+}
+
+// ─── Speaking control ──────────────────────────────────────
+function startSpeakingWave() {
+  isSpeaking = true;
+  setStatus('speaking');
+  waveTarget = 0.7;
+  clearInterval(waveVarianceTimer);
+  waveVarianceTimer = setInterval(() => {
+    if (isSpeaking) waveTarget = 0.45 + Math.random() * 0.55;
+  }, 180);
+}
+
+function stopSpeakingWave() {
+  isSpeaking = false;
+  waveTarget = 0;
+  clearInterval(waveVarianceTimer);
+}
+
+// ─── Status helper ─────────────────────────────────────────
+function setStatus(s) {
+  const el = document.getElementById('status');
+  el.textContent = s;
+  el.style.color = s === 'speaking'
+    ? 'rgba(255,255,255,0.22)'
+    : s === 'thinking'
+    ? 'rgba(255,255,255,0.15)'
+    : 'rgba(255,255,255,0.08)';
+}
+
+function setTranscript(t) {
+  document.getElementById('transcript').textContent = t;
+}
+
+// ─── Speech Synthesis ──────────────────────────────────────
+function speak(text, onEnd) {
+  window.speechSynthesis.cancel();
+  const utt = new SpeechSynthesisUtterance(text);
+  utt.rate = 1.0;
+  utt.pitch = 1.0;
+
+  // Pick a natural voice if available
+  const voices = speechSynthesis.getVoices();
+  const preferred = voices.find(v =>
+    /en.*US/i.test(v.lang) && /natural|neural|premium|Google/i.test(v.name)
+  ) || voices.find(v => /en/i.test(v.lang));
+  if (preferred) utt.voice = preferred;
+
+  utt.onstart = startSpeakingWave;
+  utt.onend = () => { stopSpeakingWave(); onEnd && onEnd(); };
+  utt.onerror = () => { stopSpeakingWave(); onEnd && onEnd(); };
+  speechSynthesis.speak(utt);
+}
+
+// ─── Groq API ──────────────────────────────────────────────
+async function askGroq(userText) {
+  conversationHistory.push({ role: 'user', content: userText });
+
+  const body = {
+    model: 'llama-3.3-70b-versatile',
+    messages: [
+      {
+        role: 'system',
+        content: 'You are a voice assistant. Reply in concise, natural spoken language. No markdown, no lists, no special characters. Keep answers under 3 sentences unless asked for more detail.'
+      },
+      ...conversationHistory
+    ],
+    max_tokens: 256,
+    temperature: 0.7
+  };
+
+  const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${GROQ_KEY}`
+    },
+    body: JSON.stringify(body)
+  });
+
+  const data = await res.json();
+  if (data.error) throw new Error(data.error.message);
+
+  const reply = data.choices[0].message.content.trim();
+  conversationHistory.push({ role: 'assistant', content: reply });
+
+  // Keep history manageable
+  if (conversationHistory.length > 20) conversationHistory = conversationHistory.slice(-20);
+
+  return reply;
+}
+
+// ─── Speech Recognition ────────────────────────────────────
+function setupRecognition() {
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) { setStatus('browser not supported'); return; }
+
+  recognition = new SR();
+  recognition.lang = 'en-US';
+  recognition.continuous = false;
+  recognition.interimResults = true;
+  recognition.maxAlternatives = 1;
+
+  let finalText = '';
+
+  recognition.onstart = () => {
+    if (!isSpeaking) setStatus('listening');
+    finalText = '';
+  };
+
+  recognition.onresult = (e) => {
+    let interim = '';
+    finalText = '';
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      if (e.results[i].isFinal) finalText += e.results[i][0].transcript;
+      else interim += e.results[i][0].transcript;
+    }
+    setTranscript(finalText || interim);
+  };
+
+  recognition.onend = () => {
+    if (finalText.trim() && !isProcessing && !isSpeaking) {
+      handleUserSpeech(finalText.trim());
+    } else if (!isSpeaking) {
+      // Restart immediately if nothing to process
+      safeStartListening();
+    }
+  };
+
+  recognition.onerror = (e) => {
+    if (e.error === 'no-speech' || e.error === 'aborted') {
+      safeStartListening();
+    } else {
+      setStatus('mic error: ' + e.error);
+      setTimeout(safeStartListening, 2000);
+    }
+  };
+}
+
+function safeStartListening() {
+  if (isProcessing || isSpeaking) return;
+  try { recognition.start(); } catch(e) { /* already running */ }
+}
+
+async function handleUserSpeech(text) {
+  if (isProcessing) return;
+  isProcessing = true;
+  setStatus('thinking');
+  setTranscript('');
+
+  try {
+    const reply = await askGroq(text);
+    speak(reply, () => {
+      isProcessing = false;
+      setTranscript('');
+      safeStartListening();
+    });
+  } catch (err) {
+    speak('Sorry, I had trouble connecting. Please try again.', () => {
+      isProcessing = false;
+      safeStartListening();
+    });
+  }
+}
+
+// ─── Mic amplitude for idle visualization ─────────────────
+async function setupMicAnalyser() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    audioCtx = new AudioContext();
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 256;
+    micData = new Uint8Array(analyser.frequencyBinCount);
+    micSource = audioCtx.createMediaStreamSource(stream);
+    micSource.connect(analyser);
+  } catch (e) {
+    console.warn('Mic analyser unavailable:', e);
+  }
+}
+
+// ─── Start app ─────────────────────────────────────────────
+function startApp() {
+  const key = document.getElementById('apiKey').value.trim();
+  if (!key) return;
+  GROQ_KEY = key;
+
+  document.getElementById('setup').style.display = 'none';
+  document.getElementById('app').style.display = 'flex';
+
+  resizeCanvas();
+  drawWave();
+
+  // Load voices then start
+  speechSynthesis.getVoices();
+  speechSynthesis.onvoiceschanged = () => {};
+
+  setupMicAnalyser().then(() => {
+    setupRecognition();
+    safeStartListening();
+  });
+}
+
+// Allow Enter key on setup
+document.getElementById('apiKey').addEventListener('keydown', e => {
+  if (e.key === 'Enter') startApp();
+});
+
+// When assistant stops speaking, restart listening
+// (polled because synthesis events can be unreliable)
+setInterval(() => {
+  if (!isSpeaking && !isProcessing && recognition) {
+    try { recognition.start(); } catch(e) {}
+  }
+}, 1500);
+</script>
+</body>
+</html>
